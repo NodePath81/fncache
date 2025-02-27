@@ -19,7 +19,6 @@ type InMemoryCache[FnParams comparable, FnReturns any] struct {
 	ttl   time.Duration
 	cache sync.Map // maps FnParams to *cacheEntry[FnReturns]
 	done  chan struct{}
-	wg    sync.WaitGroup
 }
 
 func NewInMemoryCache[FnParams comparable, FnReturns any](ttl time.Duration) *InMemoryCache[FnParams, FnReturns] {
@@ -27,8 +26,6 @@ func NewInMemoryCache[FnParams comparable, FnReturns any](ttl time.Duration) *In
 		ttl:  ttl,
 		done: make(chan struct{}),
 	}
-	c.wg.Add(1)
-	go c.cleaner()
 	return c
 }
 
@@ -55,13 +52,40 @@ func (c *InMemoryCache[FnParams, FnReturns]) Get(ctx context.Context, params FnP
 }
 
 func (c *InMemoryCache[FnParams, FnReturns]) Set(ctx context.Context, params FnParams, value FnReturns) error {
-	wp := weak.Make(&value)
+	ptr := &value
+	wp := weak.Make(ptr)
+
 	entry := &cacheEntry[FnReturns]{
 		value:     wp,
 		expiresAt: time.Now().Add(c.ttl),
 	}
+
 	c.cache.Store(params, entry)
-	runtime.KeepAlive(value)
+
+	cancelCh := make(chan struct{})
+
+	runtime.AddCleanup[FnReturns, FnParams](ptr, func(fp FnParams) {
+		c.cache.Delete(fp)
+		close(cancelCh)
+	}, params)
+
+	go func() {
+		ticker := time.NewTicker(c.ttl)
+		defer ticker.Stop()
+
+		select {
+		case <-c.done:
+			return
+		case <-cancelCh:
+			return
+		case <-ticker.C:
+			if _, ok := c.cache.Load(params); ok {
+				c.cache.Delete(params)
+			}
+		}
+	}()
+
+	runtime.KeepAlive(ptr)
 	return nil
 }
 
@@ -71,25 +95,4 @@ func (c *InMemoryCache[FnParams, FnReturns]) Delete(ctx context.Context, params 
 
 func (c *InMemoryCache[FnParams, FnReturns]) Stop() {
 	close(c.done)
-	c.wg.Wait()
-}
-
-func (c *InMemoryCache[FnParams, FnReturns]) cleaner() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(c.ttl / 2)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			now := time.Now()
-			c.cache.Range(func(key, value interface{}) bool {
-				if entry, ok := value.(*cacheEntry[FnReturns]); ok && now.After(entry.expiresAt) {
-					c.cache.Delete(key)
-				}
-				return true
-			})
-		case <-c.done:
-			return
-		}
-	}
 }
